@@ -187,14 +187,21 @@ class BlueskyClient:
 # ---------------------------------------------------------------------------
 # BR parsing — evetools format
 # ---------------------------------------------------------------------------
-def parse_evetools_brs(data: dict) -> list:
+def parse_evetools_brs(data) -> list:
     """Parse evetools API response into normalized BR list."""
     results = []
 
-    if not data.get("success") or not data.get("data"):
+    # API may return {"success": true, "data": [...]} or a bare list
+    if isinstance(data, dict):
+        if not data.get("success") or not data.get("data"):
+            return results
+        groups = data["data"]
+    elif isinstance(data, list):
+        groups = data
+    else:
         return results
 
-    for group in data["data"]:
+    for group in groups:
         for item in group.get("items", []):
             uuid = item.get("uuid")
             if not uuid:
