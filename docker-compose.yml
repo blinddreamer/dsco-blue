@@ -1,0 +1,18 @@
+services:
+  dsco-bluesky-bot:
+    build: .
+    container_name: dsco-bluesky-bot
+    restart: unless-stopped
+    environment:
+      - BLUESKY_HANDLE=your-handle.bsky.social    # <-- Change this
+      - BLUESKY_APP_PASSWORD=zfai-dyog-377b-iydm
+      - POLL_INTERVAL=600          # Poll every 10 minutes
+      - MIN_PILOTS=20              # Minimum pilots in BR to post
+      - MIN_ISK_DESTROYED=500000000  # 500M ISK minimum destroyed
+      - MIN_EFFICIENCY=55          # Minimum ISK efficiency %
+      - LOG_LEVEL=INFO
+    volumes:
+      - bot-data:/data             # Persist seen BRs across restarts
+
+volumes:
+  bot-data:
