@@ -5,14 +5,13 @@ Polls EVE Online battle report APIs for Fraternity. wins and posts them to Blues
 """
 
 import os
-import json
 import time
 import random
 import logging
-import hashlib
+from contextlib import closing
 from datetime import datetime, timezone
-from pathlib import Path
 
+import pymysql
 import requests
 
 # ---------------------------------------------------------------------------
@@ -48,8 +47,13 @@ MIN_PILOTS = int(os.getenv("MIN_PILOTS", "20"))  # minimum pilots to post
 MIN_ISK_DESTROYED = float(os.getenv("MIN_ISK_DESTROYED", "500000000"))  # 500M ISK minimum
 MIN_EFFICIENCY = float(os.getenv("MIN_EFFICIENCY", "55"))  # minimum ISK efficiency %
 
-SEEN_FILE = Path(os.getenv("SEEN_FILE", "/data/seen_brs.json"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+DB_HOST     = os.getenv("DB_HOST", "localhost")
+DB_PORT     = int(os.getenv("DB_PORT", "3306"))
+DB_USER     = os.getenv("DB_USER", "")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_NAME     = os.getenv("DB_NAME", "dsco_bot")
 
 EVETOOLS_API = "https://br.evetools.org/api/v1/recent-br"
 EVETOOLS_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; dsco-bluesky-bot/1.0)"}
@@ -86,22 +90,45 @@ SMIRKY_TEMPLATES = [
 ]
 
 # ---------------------------------------------------------------------------
-# Persistence — track which BRs we already posted
+# Persistence — MariaDB
 # ---------------------------------------------------------------------------
+def _db():
+    return pymysql.connect(
+        host=DB_HOST, port=DB_PORT,
+        user=DB_USER, password=DB_PASSWORD,
+        database=DB_NAME, charset="utf8mb4",
+        autocommit=True,
+    )
+
+
+def init_db():
+    with closing(_db()) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS seen_brs (
+                    br_key VARCHAR(255) PRIMARY KEY,
+                    seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+    log.info("DB ready")
+
+
 def load_seen() -> set:
-    if SEEN_FILE.exists():
-        try:
-            return set(json.loads(SEEN_FILE.read_text()))
-        except Exception:
-            return set()
-    return set()
+    with closing(_db()) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT br_key FROM seen_brs")
+            return {row[0] for row in cur.fetchall()}
 
 
 def save_seen(seen: set):
-    SEEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    # Keep only last 500 to avoid unbounded growth
-    trimmed = sorted(seen)[-500:]
-    SEEN_FILE.write_text(json.dumps(trimmed))
+    if not seen:
+        return
+    with closing(_db()) as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT IGNORE INTO seen_brs (br_key) VALUES (%s)",
+                [(k,) for k in seen],
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +408,12 @@ def main():
     log.info(f"  Min pilots: {MIN_PILOTS}")
     log.info(f"  Min ISK destroyed: {format_isk(MIN_ISK_DESTROYED)}")
     log.info(f"  Min efficiency: {MIN_EFFICIENCY}%")
+
+    try:
+        init_db()
+    except Exception as e:
+        log.error(f"Failed to connect to DB: {e}")
+        return
 
     client = BlueskyClient(BLUESKY_HANDLE, BLUESKY_APP_PASSWORD)
     seen = load_seen()

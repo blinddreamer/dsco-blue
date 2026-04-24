@@ -11,8 +11,8 @@ services:
       - MIN_ISK_DESTROYED=500000000  # 500M ISK minimum destroyed
       - MIN_EFFICIENCY=55          # Minimum ISK efficiency %
       - LOG_LEVEL=INFO
-    volumes:
-      - bot-data:/data             # Persist seen BRs across restarts
-
-volumes:
-  bot-data:
+      - DB_HOST=your-mariadb-host  # <-- Change this
+      - DB_PORT=3306
+      - DB_USER=your-db-user       # <-- Change this
+      - DB_PASSWORD=your-db-pass   # <-- Change this
+      - DB_NAME=dsco_bot
