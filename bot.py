@@ -231,23 +231,41 @@ def parse_evetools_brs(data) -> list:
             if ally_id in frat_team_set
         )
 
-        # Get system name
+        # Get system name and ID for dedup key
         system_name = "Unknown"
+        system_id = 0
+        start_ts = 0
         if timings:
-            sys_info = timings[0].get("system", {})
+            t = timings[0]
+            sys_info = t.get("system", {})
             system_name = sys_info.get("name", "Unknown")
+            system_id = t.get("systemID", 0)
+            start_ts = t.get("start", 0)
 
         results.append({
             "uuid": br_id,
             "source": "evetools",
             "system": system_name,
-            "isk_destroyed": total_lost_isk,  # total battle ISK (both sides combined)
+            "_dedup_key": (system_id, start_ts // 86400),  # same system, same UTC day
+            "isk_destroyed": total_lost_isk,
             "isk_lost": 0,
-            "efficiency": 0,                  # no per-team ISK in this endpoint
+            "efficiency": 0,
             "pilots": total_pilots,
             "frat_pilots": frat_pilots,
             "url": f"https://br.evetools.org/br/{br_id}",
         })
+
+    # Keep only the largest BR (by ISK) per system per day — same battle
+    # submits many slightly different reports; posting all of them is spam.
+    best: dict[tuple, dict] = {}
+    for br in results:
+        key = br["_dedup_key"]
+        if key not in best or br["isk_destroyed"] > best[key]["isk_destroyed"]:
+            best[key] = br
+    results = list(best.values())
+
+    for br in results:
+        del br["_dedup_key"]
 
     return results
 
