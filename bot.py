@@ -52,7 +52,7 @@ SEEN_FILE = Path(os.getenv("SEEN_FILE", "/data/seen_brs.json"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 EVETOOLS_API = "https://br.evetools.org/api/v1/recent-br"
-WARBEACON_API = "https://warbeacon.net/api/br/recent"
+EVETOOLS_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; dsco-bluesky-bot/1.0)"}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -188,130 +188,48 @@ class BlueskyClient:
 # BR parsing — evetools format
 # ---------------------------------------------------------------------------
 def parse_evetools_brs(data) -> list:
-    """Parse evetools API response into normalized BR list."""
+    """Parse evetools API response into normalized BR list.
+
+    Current format: flat list of BR objects with fields:
+      _id, teams ([["alliance_id",...], [...]], totalLost (combined ISK),
+      totalPilots, allys ([["alliance_id", count], ...]), timings
+    No per-team ISK breakdown is available in this endpoint.
+    """
     results = []
 
-    # API may return {"success": true, "data": [...]} or a bare list
-    if isinstance(data, dict):
-        if not data.get("success") or not data.get("data"):
-            return results
-        groups = data["data"]
-    elif isinstance(data, list):
-        groups = data
-    else:
+    if not isinstance(data, list):
         return results
-
-    for group in groups:
-        for item in group.get("items", []):
-            uuid = item.get("uuid")
-            if not uuid:
-                continue
-
-            teams_meta = item.get("teamsMetadata", [])
-            teams_raw = item.get("teams", [])
-            locations = item.get("locations", [])
-            participant_count = item.get("participantCount", 0)
-
-            if participant_count < MIN_PILOTS:
-                continue
-
-            # Find which team Fraternity is on
-            frat_team_id = None
-            for idx, team in enumerate(teams_raw):
-                for key in team.keys():
-                    # Keys are like "alliance_99003581" or "corporation_98519746"
-                    entity_id = key.split("_", 1)[1] if "_" in key else key
-                    if entity_id == FRATERNITY_ALLIANCE_ID or entity_id == DSCO_CORP_ID:
-                        frat_team_id = idx
-                        break
-                if frat_team_id is not None:
-                    break
-
-            if frat_team_id is None:
-                continue
-
-            # Get ISK values per team
-            frat_loss = 0
-            enemy_loss = 0
-            frat_participants = 0
-
-            for meta in teams_meta:
-                tid = meta.get("teamId", -1)
-                loss_val = meta.get("totalLossValue", 0)
-                pcount = meta.get("participantCount", 0)
-
-                if tid == frat_team_id:
-                    frat_loss = loss_val
-                    frat_participants = pcount
-                else:
-                    enemy_loss += loss_val
-
-            total_destroyed = enemy_loss
-            total_lost = frat_loss
-
-            if total_destroyed + total_lost == 0:
-                continue
-
-            efficiency = (total_destroyed / (total_destroyed + total_lost)) * 100
-
-            # Get system name from first location
-            system_name = "Unknown"
-            region_name = ""
-            if locations:
-                system_name = locations[0].get("name", "Unknown")
-
-            results.append({
-                "uuid": uuid,
-                "source": "evetools",
-                "system": system_name,
-                "efficiency": round(efficiency, 1),
-                "isk_destroyed": total_destroyed,
-                "isk_lost": total_lost,
-                "pilots": participant_count,
-                "frat_pilots": frat_participants,
-                "url": f"https://br.evetools.org/br/{uuid}",
-            })
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# BR parsing — warbeacon format
-# ---------------------------------------------------------------------------
-def parse_warbeacon_brs(data: list) -> list:
-    """Parse warbeacon API response into normalized BR list."""
-    results = []
 
     for item in data:
         br_id = item.get("_id")
         if not br_id:
             continue
 
-        teams = item.get("teams", [])
-        allys = item.get("allys", [])
-        timings = item.get("timings", [])
+        teams = item.get("teams", [])        # list of two lists of alliance/corp ID strings
+        allys = item.get("allys", [])         # [["alliance_id", pilot_count], ...]
         total_pilots = item.get("totalPilots", 0)
+        total_lost_isk = item.get("totalLost", 0)   # combined ISK both sides
+        timings = item.get("timings", [])
 
         if total_pilots < MIN_PILOTS:
             continue
 
-        # Check if Fraternity is in the fight
-        frat_in_allys = any(
-            a[0] == FRATERNITY_ALLIANCE_ID for a in allys if isinstance(a, list)
-        )
-        if not frat_in_allys:
-            continue
-
-        # Find which team Frat is on
+        # Find which team Fraternity is on
         frat_team_idx = None
         for idx, team in enumerate(teams):
-            if FRATERNITY_ALLIANCE_ID in team:
+            if FRATERNITY_ALLIANCE_ID in team or f"corp:{DSCO_CORP_ID}" in team:
                 frat_team_idx = idx
                 break
 
         if frat_team_idx is None:
-            # Teams not sorted yet — skip (can't determine win/loss)
             continue
+
+        # Count Frat-side pilots from allys
+        frat_team_set = set(teams[frat_team_idx])
+        frat_pilots = sum(
+            count for ally_id, count in allys
+            if ally_id in frat_team_set
+        )
 
         # Get system name
         system_name = "Unknown"
@@ -319,22 +237,20 @@ def parse_warbeacon_brs(data: list) -> list:
             sys_info = timings[0].get("system", {})
             system_name = sys_info.get("name", "Unknown")
 
-        # Warbeacon doesn't have per-team ISK in the recent endpoint
-        # so we use it mainly as a backup / dedup source
         results.append({
             "uuid": br_id,
-            "source": "warbeacon",
+            "source": "evetools",
             "system": system_name,
-            "url": f"https://warbeacon.net/br/report/{br_id}",
-            "pilots": total_pilots,
-            # These will be 0 — evetools is preferred for ISK data
-            "efficiency": 0,
-            "isk_destroyed": 0,
+            "isk_destroyed": total_lost_isk,  # total battle ISK (both sides combined)
             "isk_lost": 0,
-            "frat_pilots": 0,
+            "efficiency": 0,                  # no per-team ISK in this endpoint
+            "pilots": total_pilots,
+            "frat_pilots": frat_pilots,
+            "url": f"https://br.evetools.org/br/{br_id}",
         })
 
     return results
+
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +271,11 @@ def format_isk(value: float) -> str:
 # Generate post text
 # ---------------------------------------------------------------------------
 def generate_post(br: dict) -> str:
-    template = random.choice(SMIRKY_TEMPLATES)
+    if br["efficiency"] == 0:
+        templates = [t for t in SMIRKY_TEMPLATES if "{efficiency}" not in t]
+    else:
+        templates = SMIRKY_TEMPLATES
+    template = random.choice(templates)
     text = template.format(
         system=br["system"],
         efficiency=br["efficiency"],
@@ -377,7 +297,7 @@ def poll_and_post(client: BlueskyClient, seen: set) -> set:
     # --- Poll evetools (preferred — has per-team ISK) ---
     try:
         log.debug("Polling evetools API...")
-        resp = requests.get(EVETOOLS_API, timeout=30)
+        resp = requests.get(EVETOOLS_API, headers=EVETOOLS_HEADERS, timeout=30)
         resp.raise_for_status()
         evetools_brs = parse_evetools_brs(resp.json())
         log.info(f"evetools: found {len(evetools_brs)} Fraternity BRs")
@@ -396,11 +316,11 @@ def poll_and_post(client: BlueskyClient, seen: set) -> set:
 
         # Check minimum thresholds
         if br["isk_destroyed"] < MIN_ISK_DESTROYED:
-            log.debug(f"Skipping {br['uuid']}: ISK destroyed {format_isk(br['isk_destroyed'])} below threshold")
+            log.debug(f"Skipping {br['uuid']}: ISK {format_isk(br['isk_destroyed'])} below threshold")
             seen.add(br_key)
             continue
 
-        if br["efficiency"] < MIN_EFFICIENCY:
+        if br["efficiency"] > 0 and br["efficiency"] < MIN_EFFICIENCY:
             log.debug(f"Skipping {br['uuid']}: efficiency {br['efficiency']}% below threshold")
             seen.add(br_key)
             continue
