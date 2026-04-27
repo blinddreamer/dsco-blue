@@ -183,20 +183,8 @@ class BlueskyClient:
         if embed:
             record["embed"] = embed
 
-        resp = requests.post(
-            f"{self.pds}/xrpc/com.atproto.repo.createRecord",
-            headers={"Authorization": f"Bearer {self.session['accessJwt']}"},
-            json={
-                "repo": self.session["did"],
-                "collection": "app.bsky.feed.post",
-                "record": record,
-            },
-        )
-
-        if resp.status_code == 401:
-            log.info("Token expired, re-authenticating...")
-            self.login()
-            resp = requests.post(
+        def _do_post():
+            return requests.post(
                 f"{self.pds}/xrpc/com.atproto.repo.createRecord",
                 headers={"Authorization": f"Bearer {self.session['accessJwt']}"},
                 json={
@@ -205,6 +193,20 @@ class BlueskyClient:
                     "record": record,
                 },
             )
+
+        resp = _do_post()
+
+        # Bluesky returns 401 for invalid tokens, but sometimes returns 400
+        # with error "ExpiredToken" — handle both by re-authenticating once.
+        if resp.status_code in (400, 401):
+            try:
+                err = resp.json().get("error", "")
+            except Exception:
+                err = ""
+            if resp.status_code == 401 or err in ("ExpiredToken", "AuthenticationRequired"):
+                log.info(f"Session expired ({resp.status_code} {err}), re-authenticating...")
+                self.login()
+                resp = _do_post()
 
         resp.raise_for_status()
         log.info(f"Posted to Bluesky: {text[:80]}...")
