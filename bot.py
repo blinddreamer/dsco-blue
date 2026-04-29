@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 import pymysql
 import requests
+from collections import defaultdict
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -23,29 +24,9 @@ BLUESKY_APP_PASSWORD = os.getenv("BLUESKY_APP_PASSWORD", "")
 FRATERNITY_ALLIANCE_ID = "99003581"
 DSCO_CORP_ID = "98519746"
 
-# Friendly alliance IDs that fight alongside Fraternity
-FRIENDLY_ALLIANCES = {
-    "99003581",   # Fraternity.
-    "498125261",  # Fraternity. ally
-    "1727758877", # Fraternity. ally
-    "1042504553", # Fraternity. ally
-    "99013541",   # Fraternity. ally
-    "99002685",   # Fraternity. ally
-    "386292982",  # Fraternity. ally
-    "99005393",   # Fraternity. ally
-    "99001317",   # Fraternity. ally
-    "99009129",   # Fraternity. ally
-    "99013537",   # Fraternity. ally
-    "154104258",  # Fraternity. ally
-    "1411711376", # Fraternity. ally
-    "99007203",   # Fraternity. ally
-    "99011168",   # Fraternity. ally
-}
-
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "600"))  # seconds
 MIN_PILOTS = int(os.getenv("MIN_PILOTS", "20"))  # minimum pilots to post
 MIN_ISK_DESTROYED = float(os.getenv("MIN_ISK_DESTROYED", "500000000"))  # 500M ISK minimum
-MIN_EFFICIENCY = float(os.getenv("MIN_EFFICIENCY", "55"))  # minimum ISK efficiency %
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
@@ -56,6 +37,7 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_NAME     = os.getenv("DB_NAME", "dsco_bot")
 
 EVETOOLS_API = "https://br.evetools.org/api/v1/recent-br"
+EVETOOLS_COMPOSITION_API = "https://br.evetools.org/newapi/br/composition/{}"
 EVETOOLS_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; dsco-bluesky-bot/1.0)"}
 
 # ---------------------------------------------------------------------------
@@ -87,6 +69,36 @@ SMIRKY_TEMPLATES = [
     "Roses are red, wrecks are too. {isk_destroyed} ISK destroyed. GF to you. 🌹",
     "Fleet pinged. Fleet formed. Fleet dunked. {system}. {efficiency}%. EZ.",
     "POV: you jump into {system} and see Fraternity. on grid. {isk_destroyed} ISK destroyed.",
+    "The enemy FC is currently updating their résumé. {system}, {isk_destroyed} destroyed. 📝",
+    "{pilots} pilots. One outcome. {isk_destroyed} ISK gone. {system} added to the list.",
+    "Skill issue detected in {system}. {isk_destroyed} ISK removed from the game. 🛠️",
+    "Hot drop? Structure bash? Doesn't matter. {system}. {isk_destroyed}. We showed up.",
+    "Some called it a bait. Fraternity. called it content. {system}. {isk_destroyed} ISK destroyed.",
+    "Good fight! (It wasn't for them.) {system}, {isk_destroyed} ISK destroyed. 🤝",
+    "The battle for {system} lasted long enough to hurt. {isk_destroyed} ISK says so.",
+    "News from the front: {system} still belongs to whoever has more ships. Currently us. {isk_destroyed} ISK.",
+    "They formed. We formed harder. {system}. {isk_destroyed} gone. Simple.",
+    "In {system} today, {pilots} pilots learned an important lesson about grid awareness. {isk_destroyed} ISK tuition paid.",
+    "Warp to zero. Apply damage. Collect tears. {system}. {isk_destroyed} ISK destroyed. 😢",
+    "Another killboard update brought to you by Fraternity. in {system}. {isk_destroyed} ISK. You're welcome.",
+    "{isk_destroyed} ISK destroyed in {system}. The enemy fleet is now a debris field. 🌌",
+    "The map turned red in {system}. {isk_destroyed} ISK destroyed. Fraternity. sends its regards. 🔴",
+    "Bridge up. Fleet in. Fleet wins. {system}. {isk_destroyed}. Classic.",
+    "Field control established in {system}. {isk_destroyed} ISK taxed from the locals. 💰",
+    "They thought the numbers were in their favor. {system} disagrees. {isk_destroyed} ISK destroyed.",
+    "Cap escalation? Sure. {system} handled it. {isk_destroyed} ISK handled with it. 🚀",
+    "Intel said 'not that many.' Intel was wrong. {system}. {isk_destroyed} destroyed.",
+    "Logi died first. The rest followed. {system}. {isk_destroyed} ISK. Story as old as EVE.",
+    "{system}: visited by Fraternity., reviewed one star, would not recommend undocking. {isk_destroyed} ISK.",
+    "FC said 'hold cloak.' Nobody held cloak. {isk_destroyed} ISK destroyed in {system}.",
+    "Another day, another system on the board. {system}. {isk_destroyed} ISK. Don't be late to the next one.",
+    "They undocked. We noticed. {system}. {isk_destroyed} ISK destroyed. Noticed very hard. 👀",
+    "Battle report filed. Enemy tears collected. {system}. {isk_destroyed} ISK gone. Have a good evening.",
+    "If you're reading this you lost ships in {system}. {isk_destroyed} ISK. GG no RE. 🫠",
+    "Sometimes EVE is a strategy game. Sometimes it's {system}. {isk_destroyed} ISK destroyed.",
+    "The wrecks in {system} tell a story. {isk_destroyed} ISK. It's not a happy one for the other side.",
+    "D-SCO on comms: 'gf.' D-SCO on zkill: {isk_destroyed} destroyed in {system}. Both true. ✌️",
+    "Local was fun in {system} for exactly one side. {isk_destroyed} ISK destroyed. Guess which side.",
 ]
 
 # ---------------------------------------------------------------------------
@@ -243,22 +255,34 @@ def parse_evetools_brs(data) -> list:
         if total_pilots < MIN_PILOTS:
             continue
 
-        # Find which team Fraternity is on
+        # ally_id → pilot count lookup
+        # No team data = can't determine winner, skip.
+        if not teams:
+            continue
+
+        ally_pilot_map = {ally_id: count for ally_id, count in allys}
+
+        # teams entries may be a list of IDs or, rarely, a bare string.
+        def _team_ids(team_entry):
+            if isinstance(team_entry, list):
+                return team_entry
+            if isinstance(team_entry, str):
+                return [team_entry]
+            return []
+
+        # Find which team FRT is on.
         frat_team_idx = None
         for idx, team in enumerate(teams):
-            if FRATERNITY_ALLIANCE_ID in team or f"corp:{DSCO_CORP_ID}" in team:
+            if FRATERNITY_ALLIANCE_ID in _team_ids(team) or f"corp:{DSCO_CORP_ID}" in _team_ids(team):
                 frat_team_idx = idx
                 break
 
         if frat_team_idx is None:
             continue
 
-        # Count Frat-side pilots from allys
-        frat_team_set = set(teams[frat_team_idx])
-        frat_pilots = sum(
-            count for ally_id, count in allys
-            if ally_id in frat_team_set
-        )
+        # Normalise teams to lists of strings for later use
+        norm_teams = [_team_ids(t) for t in teams]
+        frat_pilots = sum(ally_pilot_map.get(a, 0) for a in norm_teams[frat_team_idx])
 
         # Get system name and ID for dedup key
         system_name = "Unknown"
@@ -281,6 +305,8 @@ def parse_evetools_brs(data) -> list:
             "efficiency": 0,
             "pilots": total_pilots,
             "frat_pilots": frat_pilots,
+            "_norm_teams": norm_teams,
+            "_frat_team_idx": frat_team_idx,
             "url": f"https://br.evetools.org/br/{br_id}",
         })
 
@@ -298,6 +324,44 @@ def parse_evetools_brs(data) -> list:
 
     return results
 
+
+def fetch_team_isk_lost(br_id: str, norm_teams: list, frat_team_idx: int) -> tuple:
+    """Fetch composition data and return (frat_isk_lost, enemy_isk_lost).
+
+    Calls /newapi/br/composition/{id}, iterates every killmail, and sums ISK
+    lost per team based on the victim's alliance ID.
+    Returns (0, 0) on any error so the caller can decide what to do.
+    """
+    try:
+        resp = requests.get(
+            EVETOOLS_COMPOSITION_API.format(br_id),
+            headers=EVETOOLS_HEADERS,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        log.warning(f"Composition fetch failed for {br_id}: {e}")
+        return 0, 0
+
+    # Build lookup: str(alliance_id) -> team index
+    team_lookup = {}
+    for idx, team_ids in enumerate(norm_teams):
+        for ally_id in team_ids:
+            team_lookup[str(ally_id)] = idx
+
+    isk_by_team = defaultdict(float)
+    for related in data.get("relateds", []):
+        for km in related.get("kms", []):
+            victim_ally = str(km.get("victim", {}).get("ally", 0))
+            value = km.get("totalValue", 0)
+            team_idx = team_lookup.get(victim_ally)
+            if team_idx is not None:
+                isk_by_team[team_idx] += value
+
+    frat_isk = isk_by_team.get(frat_team_idx, 0)
+    enemy_isk = sum(v for k, v in isk_by_team.items() if k != frat_team_idx)
+    return frat_isk, enemy_isk
 
 
 # ---------------------------------------------------------------------------
@@ -367,16 +431,35 @@ def poll_and_post(client: BlueskyClient, seen: set) -> set:
             seen.add(br_key)
             continue
 
-        if br["efficiency"] > 0 and br["efficiency"] < MIN_EFFICIENCY:
-            log.debug(f"Skipping {br['uuid']}: efficiency {br['efficiency']}% below threshold")
+        # Fetch per-team ISK from the composition endpoint and compare.
+        frat_isk, enemy_isk = fetch_team_isk_lost(
+            br["uuid"], br["_norm_teams"], br["_frat_team_idx"]
+        )
+
+        if frat_isk == 0 and enemy_isk == 0:
+            # Composition fetch failed — skip to avoid false positives.
+            log.warning(f"Skipping {br['uuid']}: could not fetch composition data")
             seen.add(br_key)
             continue
 
-        # It's a win worth posting!
+        efficiency = enemy_isk / (frat_isk + enemy_isk) * 100 if (frat_isk + enemy_isk) > 0 else 0
+
+        if frat_isk >= enemy_isk:
+            log.info(
+                f"Skipping {br['uuid']}: FRT lost {format_isk(frat_isk)} "
+                f"vs enemy {format_isk(enemy_isk)} — loss, not posting"
+            )
+            seen.add(br_key)
+            continue
+
+        # Update BR dict with real per-team ISK so the post template can use it.
+        br["isk_lost"] = frat_isk
+        br["efficiency"] = round(efficiency, 1)
+
+        # It's a win — post it.
         log.info(
-            f"New win: {br['system']} | {br['efficiency']}% eff | "
-            f"destroyed {format_isk(br['isk_destroyed'])} | "
-            f"lost {format_isk(br['isk_lost'])} | {br['pilots']} pilots"
+            f"New win: {br['system']} | FRT lost {format_isk(frat_isk)} "
+            f"enemy lost {format_isk(enemy_isk)} | {efficiency:.1f}% efficiency"
         )
 
         try:
@@ -409,7 +492,6 @@ def main():
     log.info(f"  Poll interval: {POLL_INTERVAL}s")
     log.info(f"  Min pilots: {MIN_PILOTS}")
     log.info(f"  Min ISK destroyed: {format_isk(MIN_ISK_DESTROYED)}")
-    log.info(f"  Min efficiency: {MIN_EFFICIENCY}%")
 
     try:
         init_db()

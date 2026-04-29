@@ -9,7 +9,6 @@ services:
       - POLL_INTERVAL=600          # Poll every 10 minutes
       - MIN_PILOTS=20              # Minimum pilots in BR to post
       - MIN_ISK_DESTROYED=500000000  # 500M ISK minimum destroyed
-      - MIN_EFFICIENCY=55          # Minimum ISK efficiency %
       - LOG_LEVEL=INFO
       - DB_HOST=your-mariadb-host  # <-- Change this
       - DB_PORT=3306
