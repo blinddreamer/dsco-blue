@@ -436,6 +436,11 @@ def poll_and_post(client: BlueskyClient, seen: set) -> set:
             br["uuid"], br["_norm_teams"], br["_frat_team_idx"]
         )
 
+        if br["frat_pilots"] < 10:
+            log.info(f"Skipping {br['uuid']}: only {br['frat_pilots']} FRT pilots — below minimum of 10")
+            seen.add(br_key)
+            continue
+
         if frat_isk == 0 and enemy_isk == 0:
             # Composition fetch failed — skip to avoid false positives.
             log.warning(f"Skipping {br['uuid']}: could not fetch composition data")
