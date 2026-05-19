@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 D-SCO Bluesky Battle Report Bot
-Polls EVE Online battle report APIs for Fraternity. wins and posts them to Bluesky.
+Polls EVE Online battle report APIs for Fraternity. battles and posts them to Bluesky.
 """
 
 import os
@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 
 import pymysql
 import requests
-from collections import defaultdict
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -22,7 +21,6 @@ BLUESKY_HANDLE = os.getenv("BLUESKY_HANDLE", "")
 BLUESKY_APP_PASSWORD = os.getenv("BLUESKY_APP_PASSWORD", "")
 
 FRATERNITY_ALLIANCE_ID = "99003581"
-DSCO_CORP_ID = "98519746"
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "600"))  # seconds
 MIN_PILOTS = int(os.getenv("MIN_PILOTS", "20"))  # minimum pilots to post
@@ -37,9 +35,13 @@ DB_USER     = os.getenv("DB_USER", "")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_NAME     = os.getenv("DB_NAME", "dsco_bot")
 
-EVETOOLS_API = "https://br.evetools.org/api/v1/recent-br"
-EVETOOLS_COMPOSITION_API = "https://br.evetools.org/newapi/br/composition/{}"
-EVETOOLS_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; dsco-bluesky-bot/1.0)"}
+WARBEACON_API = "https://warbeacon.net/api/br/battle-records"
+WARBEACON_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; dsco-bluesky-bot/1.0)",
+    "Accept": "application/json",
+}
+WARBEACON_AUTO_API = "https://warbeacon.net/api/br/auto"
+ESI_NAMES_API = "https://esi.evetech.net/latest/universe/names/"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -223,92 +225,139 @@ class BlueskyClient:
 
 
 # ---------------------------------------------------------------------------
-# BR parsing — evetools format
+# BR parsing — warbeacon format
 # ---------------------------------------------------------------------------
-def parse_evetools_brs(data) -> list:
-    """Parse evetools API response into normalized BR list.
+def resolve_system_names(brs: list) -> None:
+    """Resolve solarSystemId → name via ESI, modifies BRs in-place."""
+    system_ids = list({br["_system_id"] for br in brs if br.get("_system_id")})
+    if not system_ids:
+        return
+    try:
+        resp = requests.post(ESI_NAMES_API, json=system_ids, timeout=15)
+        resp.raise_for_status()
+        id_to_name = {entry["id"]: entry["name"] for entry in resp.json()}
+        for br in brs:
+            sid = br.get("_system_id")
+            if sid:
+                br["system"] = id_to_name.get(sid, br["system"])
+    except Exception as e:
+        log.warning(f"ESI name resolution failed: {e}")
+    for br in brs:
+        br.pop("_system_id", None)
 
-    Current format: flat list of BR objects with fields:
-      _id, teams ([["alliance_id",...], [...]], totalLost (combined ISK),
-      totalPilots, allys ([["alliance_id", count], ...]), timings
-    No per-team ISK breakdown is available in this endpoint.
+
+def fetch_team_isk(solar_system_id: int, start_time: str, end_time: str) -> tuple:
+    """Fetch kills from warbeacon /api/br/auto and return (frat_isk_lost, enemy_isk_lost).
+
+    Uses attacker/victim alliance data to build team rosters the same way warbeacon does,
+    so FRT allies dying count as FRT-side losses, not enemy losses. Returns (0, 0) on failure.
     """
+    try:
+        resp = requests.post(
+            WARBEACON_AUTO_API,
+            headers=WARBEACON_HEADERS,
+            json={"locations": [{"id": solar_system_id, "startTime": start_time, "endTime": end_time}]},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        kills = resp.json().get("data", {}).get("killmails", [])
+    except Exception as e:
+        log.warning(f"warbeacon auto fetch failed for system {solar_system_id}: {e}")
+        return 0, 0
+
+    if not kills:
+        return 0, 0
+
+    frat_id = int(FRATERNITY_ALLIANCE_ID)
+
+    # Build team rosters:
+    # - FRT in attackers → victim is enemy, co-attackers are FRT allies
+    # - Known FRT ally is victim → attackers are enemies
+    frat_side = {frat_id}
+    enemy_side = set()
+
+    for kill in kills:
+        victim_alliance = kill.get("victim", {}).get("alliance_id")
+        attacker_alliances = {
+            a["alliance_id"] for a in kill.get("attackers", []) if a.get("alliance_id")
+        }
+        if frat_id in attacker_alliances:
+            if victim_alliance:
+                enemy_side.add(victim_alliance)
+            frat_side.update(attacker_alliances)
+        elif victim_alliance in frat_side:
+            enemy_side.update(attacker_alliances)
+
+    enemy_side -= frat_side
+
+    frat_isk = 0.0
+    enemy_isk = 0.0
+    for kill in kills:
+        victim_alliance = kill.get("victim", {}).get("alliance_id")
+        value = kill.get("total_value", 0)
+        if victim_alliance in frat_side:
+            frat_isk += value
+        elif victim_alliance in enemy_side:
+            enemy_isk += value
+
+    log.debug(
+        f"warbeacon auto {solar_system_id}: FRT side lost {format_isk(frat_isk)}, "
+        f"enemy lost {format_isk(enemy_isk)} "
+        f"({len(kills)} kills, {len(frat_side)} frt alliances, {len(enemy_side)} enemy alliances)"
+    )
+    return frat_isk, enemy_isk
+
+
+def parse_warbeacon_brs(data: dict) -> list:
+    """Parse warbeacon /api/br/battle-records response into normalized BR list."""
     results = []
+    records = data.get("data", {}).get("records", [])
 
-    if not isinstance(data, list):
-        return results
-
-    for item in data:
-        br_id = item.get("_id")
-        if not br_id:
+    for item in records:
+        if item.get("status") != "ended":
             continue
 
-        teams = item.get("teams", [])        # list of two lists of alliance/corp ID strings
-        allys = item.get("allys", [])         # [["alliance_id", pilot_count], ...]
-        total_pilots = item.get("totalPilots", 0)
-        total_lost_isk = item.get("totalLost", 0)   # combined ISK both sides
-        timings = item.get("timings", [])
-
-        if total_pilots < MIN_PILOTS:
+        participant_count = item.get("participantCount", 0)
+        if participant_count < MIN_PILOTS:
             continue
 
-        # ally_id → pilot count lookup
-        # No team data = can't determine winner, skip.
-        if not teams:
+        top_factions = item.get("topFactions", [])
+        frat_entry = next(
+            (f for f in top_factions if f.get("factionId") == int(FRATERNITY_ALLIANCE_ID)),
+            None,
+        )
+        if frat_entry is None:
             continue
 
-        ally_pilot_map = {ally_id: count for ally_id, count in allys}
+        solar_system_id = item.get("solarSystemId")
+        start_time = item.get("startTime", "")
+        br_link = item.get("brLink", "")
 
-        # teams entries may be a list of IDs or, rarely, a bare string.
-        def _team_ids(team_entry):
-            if isinstance(team_entry, list):
-                return team_entry
-            if isinstance(team_entry, str):
-                return [team_entry]
-            return []
-
-        # Find which team FRT is on.
-        frat_team_idx = None
-        for idx, team in enumerate(teams):
-            if FRATERNITY_ALLIANCE_ID in _team_ids(team) or f"corp:{DSCO_CORP_ID}" in _team_ids(team):
-                frat_team_idx = idx
-                break
-
-        if frat_team_idx is None:
+        if not solar_system_id or not start_time or not br_link:
             continue
 
-        # Normalise teams to lists of strings for later use
-        norm_teams = [_team_ids(t) for t in teams]
-        frat_pilots = sum(ally_pilot_map.get(a, 0) for a in norm_teams[frat_team_idx])
-
-        # Get system name and ID for dedup key
-        system_name = "Unknown"
-        system_id = 0
-        start_ts = 0
-        if timings:
-            t = timings[0]
-            sys_info = t.get("system", {})
-            system_name = sys_info.get("name", "Unknown")
-            system_id = t.get("systemID", 0)
-            start_ts = t.get("start", 0)
+        end_time = item.get("endTime", "")
+        start_hour = start_time[:13]  # "2026-05-19T15" — stable per-battle bucket
+        br_uuid = f"{solar_system_id}_{start_hour}"
 
         results.append({
-            "uuid": br_id,
-            "source": "evetools",
-            "system": system_name,
-            "_dedup_key": (system_id, start_ts // 86400),  # same system, same UTC day
-            "isk_destroyed": total_lost_isk,
+            "uuid": br_uuid,
+            "source": "warbeacon",
+            "_system_id": solar_system_id,   # popped by resolve_system_names
+            "_solar_system_id": solar_system_id,  # kept for zkillboard lookup
+            "_start_time": start_time,
+            "_end_time": end_time,
+            "system": str(solar_system_id),
+            "_dedup_key": (solar_system_id, start_hour),
+            "isk_destroyed": item.get("totalValue", 0),  # pre-filter; replaced with enemy ISK after zkill
             "isk_lost": 0,
             "efficiency": 0,
-            "pilots": total_pilots,
-            "frat_pilots": frat_pilots,
-            "_norm_teams": norm_teams,
-            "_frat_team_idx": frat_team_idx,
-            "url": f"https://br.evetools.org/br/{br_id}",
+            "pilots": participant_count,
+            "frat_pilots": frat_entry.get("participantCount", 0),
+            "url": br_link,
         })
 
-    # Keep only the largest BR (by ISK) per system per day — same battle
-    # submits many slightly different reports; posting all of them is spam.
+    # Keep only the highest-ISK record per (system, start-hour) — dedup same battle
     best: dict[tuple, dict] = {}
     for br in results:
         key = br["_dedup_key"]
@@ -320,45 +369,6 @@ def parse_evetools_brs(data) -> list:
         del br["_dedup_key"]
 
     return results
-
-
-def fetch_team_isk_lost(br_id: str, norm_teams: list, frat_team_idx: int) -> tuple:
-    """Fetch composition data and return (frat_isk_lost, enemy_isk_lost).
-
-    Calls /newapi/br/composition/{id}, iterates every killmail, and sums ISK
-    lost per team based on the victim's alliance ID.
-    Returns (0, 0) on any error so the caller can decide what to do.
-    """
-    try:
-        resp = requests.get(
-            EVETOOLS_COMPOSITION_API.format(br_id),
-            headers=EVETOOLS_HEADERS,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        log.warning(f"Composition fetch failed for {br_id}: {e}")
-        return 0, 0
-
-    # Build lookup: str(alliance_id) -> team index
-    team_lookup = {}
-    for idx, team_ids in enumerate(norm_teams):
-        for ally_id in team_ids:
-            team_lookup[str(ally_id)] = idx
-
-    isk_by_team = defaultdict(float)
-    for related in data.get("relateds", []):
-        for km in related.get("kms", []):
-            victim_ally = str(km.get("victim", {}).get("ally", 0))
-            value = km.get("totalValue", 0)
-            team_idx = team_lookup.get(victim_ally)
-            if team_idx is not None:
-                isk_by_team[team_idx] += value
-
-    frat_isk = isk_by_team.get(frat_team_idx, 0)
-    enemy_isk = sum(v for k, v in isk_by_team.items() if k != frat_team_idx)
-    return frat_isk, enemy_isk
 
 
 # ---------------------------------------------------------------------------
@@ -379,10 +389,11 @@ def format_isk(value: float) -> str:
 # Generate post text
 # ---------------------------------------------------------------------------
 def generate_post(br: dict) -> str:
+    templates = SMIRKY_TEMPLATES
     if br["efficiency"] == 0:
-        templates = [t for t in SMIRKY_TEMPLATES if "{efficiency}" not in t]
-    else:
-        templates = SMIRKY_TEMPLATES
+        templates = [t for t in templates if "{efficiency}" not in t]
+    if br["isk_lost"] == 0:
+        templates = [t for t in templates if "{isk_lost}" not in t]
     template = random.choice(templates)
     text = template.format(
         system=br["system"],
@@ -398,32 +409,33 @@ def generate_post(br: dict) -> str:
 # Main loop
 # ---------------------------------------------------------------------------
 def poll_and_post(client: BlueskyClient, seen: set) -> tuple:
-    """Poll APIs, find new Fraternity wins, post them. Returns (seen, newly_added)."""
+    """Poll warbeacon, find new Fraternity battles, post them. Returns (seen, newly_added)."""
 
     new_brs = []
     newly_added = set()
 
-    # --- Poll evetools (preferred — has per-team ISK) ---
     try:
-        log.debug("Polling evetools API...")
-        resp = requests.get(EVETOOLS_API, headers=EVETOOLS_HEADERS, timeout=30)
+        log.debug("Polling warbeacon API...")
+        resp = requests.get(WARBEACON_API, headers=WARBEACON_HEADERS, timeout=30)
         resp.raise_for_status()
-        evetools_brs = parse_evetools_brs(resp.json())
-        log.info(f"evetools: found {len(evetools_brs)} Fraternity BRs")
-        new_brs.extend(evetools_brs)
+        warbeacon_brs = parse_warbeacon_brs(resp.json())
+        log.info(f"warbeacon: found {len(warbeacon_brs)} Fraternity BRs")
+        new_brs.extend(warbeacon_brs)
     except Exception as e:
-        log.warning(f"evetools API error: {e}")
+        log.warning(f"warbeacon API error: {e}")
 
-    # --- Filter for wins we haven't posted ---
+    # Resolve system names for all new BRs in one ESI batch call
+    unresolved = [br for br in new_brs if br.get("_system_id")]
+    if unresolved:
+        resolve_system_names(unresolved)
+
     posted_count = 0
     for br in new_brs:
-        # Create a stable ID for dedup (use uuid)
         br_key = f"{br['source']}:{br['uuid']}"
 
         if br_key in seen:
             continue
 
-        # Check minimum thresholds
         if br["isk_destroyed"] < MIN_ISK_DESTROYED:
             log.debug(f"Skipping {br['uuid']}: ISK {format_isk(br['isk_destroyed'])} below threshold")
             seen.add(br_key)
@@ -436,19 +448,16 @@ def poll_and_post(client: BlueskyClient, seen: set) -> tuple:
             newly_added.add(br_key)
             continue
 
-        # Fetch per-team ISK from the composition endpoint and compare.
-        frat_isk, enemy_isk = fetch_team_isk_lost(
-            br["uuid"], br["_norm_teams"], br["_frat_team_idx"]
+        # Fetch per-side ISK from warbeacon to determine win/loss
+        frat_isk, enemy_isk = fetch_team_isk(
+            br["_solar_system_id"], br["_start_time"], br["_end_time"]
         )
 
         if frat_isk == 0 and enemy_isk == 0:
-            # Composition fetch failed — skip to avoid false positives.
-            log.warning(f"Skipping {br['uuid']}: could not fetch composition data")
+            log.warning(f"Skipping {br['uuid']}: no kill data returned for {br['system']}")
             seen.add(br_key)
             newly_added.add(br_key)
             continue
-
-        efficiency = enemy_isk / (frat_isk + enemy_isk) * 100 if (frat_isk + enemy_isk) > 0 else 0
 
         if frat_isk >= enemy_isk:
             log.info(
@@ -459,12 +468,11 @@ def poll_and_post(client: BlueskyClient, seen: set) -> tuple:
             newly_added.add(br_key)
             continue
 
-        # Update BR dict with real per-team ISK so the post template can use it.
+        efficiency = enemy_isk / (frat_isk + enemy_isk) * 100
         br["isk_destroyed"] = enemy_isk
         br["isk_lost"] = frat_isk
         br["efficiency"] = round(efficiency, 1)
 
-        # It's a win — post it.
         log.info(
             f"New win: {br['system']} | FRT lost {format_isk(frat_isk)} "
             f"enemy lost {format_isk(enemy_isk)} | {efficiency:.1f}% efficiency"
@@ -480,12 +488,11 @@ def poll_and_post(client: BlueskyClient, seen: set) -> tuple:
         seen.add(br_key)
         newly_added.add(br_key)
 
-        # Don't spam — wait a bit between posts
         if posted_count > 0:
             time.sleep(5)
 
     if posted_count == 0:
-        log.debug("No new wins to post")
+        log.debug("No new battles to post")
 
     return seen, newly_added
 
@@ -498,10 +505,11 @@ def main():
 
     log.info(f"D-SCO Bluesky Bot starting")
     log.info(f"  Handle: {BLUESKY_HANDLE}")
+    log.info(f"  Source: warbeacon (battle detection + team ISK via /api/br/auto)")
     log.info(f"  Poll interval: {POLL_INTERVAL}s")
     log.info(f"  Min pilots: {MIN_PILOTS}")
     log.info(f"  Min FRT pilots: {MIN_FRT_PILOTS}")
-    log.info(f"  Min ISK destroyed: {format_isk(MIN_ISK_DESTROYED)}")
+    log.info(f"  Min ISK: {format_isk(MIN_ISK_DESTROYED)}")
 
     try:
         init_db()

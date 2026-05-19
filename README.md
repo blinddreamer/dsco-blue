@@ -4,12 +4,15 @@ Automatically posts Fraternity. battle report wins to Bluesky with smirky propag
 
 ## How it works
 
-1. Polls `br.evetools.org/api/v1/recent-br` every 10 minutes
-2. Filters for battles where Fraternity. (alliance `99003581`) or D-SCO (corp `98519746`) participated
-3. Requires at least 10 FRT pilots present and 20+ total pilots in the fight
-4. Fetches per-team ISK from the composition endpoint — only posts if FRT's side destroyed more ISK than they lost
-5. Generates a smirky comment and posts to Bluesky with a link to the BR
-6. Deduplicates via MariaDB so the same BR is never posted twice
+1. Polls `warbeacon.net/api/br/battle-records` every 10 minutes (configurable)
+2. Filters for **ended** battles where Fraternity. (alliance `99003581`) appears in the top factions
+3. Skips battles below the minimum pilot / FRT pilot / ISK thresholds
+4. For each qualifying battle, calls `warbeacon.net/api/br/auto` to fetch the full kill list for that system + time window
+5. Builds team rosters from attacker/victim alliance IDs — FRT and any co-attackers form one side, their victims form the other
+6. Skips the battle if FRT's side lost more ISK than the enemy (loss filter)
+7. Resolves the solar system name via ESI batch lookup
+8. Picks a random smirky propaganda line and posts to Bluesky with a link to the warbeacon BR
+9. Deduplicates via MariaDB so the same battle is never posted twice
 
 ## Setup
 
@@ -57,16 +60,18 @@ python bot.py
 
 ### Optional
 
-| Variable            | Default     | Description                                                  |
-| ------------------- | ----------- | ------------------------------------------------------------ |
-| `DB_HOST`           | `localhost` | MariaDB host                                                 |
-| `DB_PORT`           | `3306`      | MariaDB port                                                 |
-| `DB_NAME`           | `dsco_bot`  | MariaDB database name                                        |
-| `POLL_INTERVAL`     | `600`       | Seconds between API polls                                    |
-| `MIN_PILOTS`        | `20`        | Minimum total pilots in BR to consider                       |
-| `MIN_FRT_PILOTS`    | `10`        | Minimum FRT pilots that must be present in the BR            |
-| `MIN_ISK_DESTROYED` | `500000000` | Minimum ISK destroyed (enemy side) to post — default 500M   |
-| `LOG_LEVEL`         | `INFO`      | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`)      |
+| Variable            | Default       | Description                                                     |
+| ------------------- | ------------- | --------------------------------------------------------------- |
+| `DB_HOST`           | `localhost`   | MariaDB host                                                    |
+| `DB_PORT`           | `3306`        | MariaDB port                                                    |
+| `DB_NAME`           | `dsco_bot`    | MariaDB database name                                           |
+| `POLL_INTERVAL`     | `600`         | Seconds between polls                                           |
+| `MIN_PILOTS`        | `20`          | Minimum total pilots in a battle to consider                    |
+| `MIN_FRT_PILOTS`    | `10`          | Minimum FRT pilots that must be present                         |
+| `MIN_ISK_DESTROYED` | `500000000`   | Minimum total battle ISK (all sides) as a pre-filter — default 500M |
+| `LOG_LEVEL`         | `INFO`        | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`)         |
+
+`MIN_ISK_DESTROYED` filters on the combined battle ISK reported by warbeacon before the per-team kill fetch — it avoids calling `/api/br/auto` for tiny skirmishes. The actual win check uses per-side ISK from the kill data.
 
 ## Customizing Comments
 
@@ -82,4 +87,13 @@ Available template variables:
 | `{isk_lost}`      | `12.6B`   | FRT ISK lost (formatted)            |
 | `{pilots}`        | `214`     | Total pilots in the fight           |
 
-Templates containing `{efficiency}` are automatically excluded when efficiency data is unavailable.
+Templates containing `{efficiency}` or `{isk_lost}` are automatically excluded from the pool when those values are unavailable.
+
+## External APIs used
+
+| API | Purpose |
+| --- | ------- |
+| `warbeacon.net/api/br/battle-records` | Poll for recent ended battles with FRT present |
+| `warbeacon.net/api/br/auto` | Fetch full kill list for a battle window to compute per-side ISK |
+| `esi.evetech.net/latest/universe/names/` | Resolve solar system IDs to names |
+| `bsky.social/xrpc/...` | Post to Bluesky |
