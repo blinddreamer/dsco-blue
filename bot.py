@@ -27,6 +27,7 @@ DSCO_CORP_ID = "98519746"
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "600"))  # seconds
 MIN_PILOTS = int(os.getenv("MIN_PILOTS", "20"))  # minimum pilots to post
 MIN_ISK_DESTROYED = float(os.getenv("MIN_ISK_DESTROYED", "500000000"))  # 500M ISK minimum
+MIN_FRT_PILOTS = int(os.getenv("MIN_FRT_PILOTS", "10"))  # minimum FRT pilots in BR
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
@@ -168,8 +169,6 @@ class BlueskyClient:
 
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-        # Build facets for the link if provided
-        facets = []
         embed = None
 
         if url:
@@ -190,8 +189,6 @@ class BlueskyClient:
             "langs": ["en"],
         }
 
-        if facets:
-            record["facets"] = facets
         if embed:
             record["embed"] = embed
 
@@ -400,10 +397,11 @@ def generate_post(br: dict) -> str:
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
-def poll_and_post(client: BlueskyClient, seen: set) -> set:
-    """Poll APIs, find new Fraternity wins, post them."""
+def poll_and_post(client: BlueskyClient, seen: set) -> tuple:
+    """Poll APIs, find new Fraternity wins, post them. Returns (seen, newly_added)."""
 
     new_brs = []
+    newly_added = set()
 
     # --- Poll evetools (preferred — has per-team ISK) ---
     try:
@@ -429,6 +427,13 @@ def poll_and_post(client: BlueskyClient, seen: set) -> set:
         if br["isk_destroyed"] < MIN_ISK_DESTROYED:
             log.debug(f"Skipping {br['uuid']}: ISK {format_isk(br['isk_destroyed'])} below threshold")
             seen.add(br_key)
+            newly_added.add(br_key)
+            continue
+
+        if br["frat_pilots"] < MIN_FRT_PILOTS:
+            log.info(f"Skipping {br['uuid']}: only {br['frat_pilots']} FRT pilots — below minimum of {MIN_FRT_PILOTS}")
+            seen.add(br_key)
+            newly_added.add(br_key)
             continue
 
         # Fetch per-team ISK from the composition endpoint and compare.
@@ -436,15 +441,11 @@ def poll_and_post(client: BlueskyClient, seen: set) -> set:
             br["uuid"], br["_norm_teams"], br["_frat_team_idx"]
         )
 
-        if br["frat_pilots"] < 10:
-            log.info(f"Skipping {br['uuid']}: only {br['frat_pilots']} FRT pilots — below minimum of 10")
-            seen.add(br_key)
-            continue
-
         if frat_isk == 0 and enemy_isk == 0:
             # Composition fetch failed — skip to avoid false positives.
             log.warning(f"Skipping {br['uuid']}: could not fetch composition data")
             seen.add(br_key)
+            newly_added.add(br_key)
             continue
 
         efficiency = enemy_isk / (frat_isk + enemy_isk) * 100 if (frat_isk + enemy_isk) > 0 else 0
@@ -455,9 +456,11 @@ def poll_and_post(client: BlueskyClient, seen: set) -> set:
                 f"vs enemy {format_isk(enemy_isk)} — loss, not posting"
             )
             seen.add(br_key)
+            newly_added.add(br_key)
             continue
 
         # Update BR dict with real per-team ISK so the post template can use it.
+        br["isk_destroyed"] = enemy_isk
         br["isk_lost"] = frat_isk
         br["efficiency"] = round(efficiency, 1)
 
@@ -475,6 +478,7 @@ def poll_and_post(client: BlueskyClient, seen: set) -> set:
             log.error(f"Failed to post BR {br['uuid']}: {e}")
 
         seen.add(br_key)
+        newly_added.add(br_key)
 
         # Don't spam — wait a bit between posts
         if posted_count > 0:
@@ -483,7 +487,7 @@ def poll_and_post(client: BlueskyClient, seen: set) -> set:
     if posted_count == 0:
         log.debug("No new wins to post")
 
-    return seen
+    return seen, newly_added
 
 
 def main():
@@ -496,6 +500,7 @@ def main():
     log.info(f"  Handle: {BLUESKY_HANDLE}")
     log.info(f"  Poll interval: {POLL_INTERVAL}s")
     log.info(f"  Min pilots: {MIN_PILOTS}")
+    log.info(f"  Min FRT pilots: {MIN_FRT_PILOTS}")
     log.info(f"  Min ISK destroyed: {format_isk(MIN_ISK_DESTROYED)}")
 
     try:
@@ -516,8 +521,8 @@ def main():
 
     while True:
         try:
-            seen = poll_and_post(client, seen)
-            save_seen(seen)
+            seen, newly_added = poll_and_post(client, seen)
+            save_seen(newly_added)
         except Exception as e:
             log.error(f"Error in poll loop: {e}", exc_info=True)
 
