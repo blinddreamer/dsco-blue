@@ -165,7 +165,7 @@ class BlueskyClient:
         self.session = resp.json()
         log.info(f"Logged in to Bluesky as {self.handle}")
 
-    def post(self, text: str, url: str = None):
+    def post(self, text: str, url: str = None, embed_title: str = "Battle Report"):
         if not self.session:
             self.login()
 
@@ -174,12 +174,11 @@ class BlueskyClient:
         embed = None
 
         if url:
-            # Add link as an external embed (card-style)
             embed = {
                 "$type": "app.bsky.embed.external",
                 "external": {
                     "uri": url,
-                    "title": "Battle Report",
+                    "title": embed_title,
                     "description": "EVE Online Battle Report",
                 },
             }
@@ -250,7 +249,9 @@ def fetch_team_isk(solar_system_id: int, start_time: str, end_time: str) -> tupl
     """Fetch kills from warbeacon /api/br/auto and return (frat_isk_lost, enemy_isk_lost).
 
     Uses attacker/victim alliance data to build team rosters the same way warbeacon does,
-    so FRT allies dying count as FRT-side losses, not enemy losses. Returns (0, 0) on failure.
+    so FRT allies dying count as FRT-side losses, not enemy losses.
+    Returns (None, None) on request failure (caller should retry next poll).
+    Returns (0, 0) if the API succeeds but no relevant kills are found.
     """
     try:
         resp = requests.post(
@@ -263,32 +264,35 @@ def fetch_team_isk(solar_system_id: int, start_time: str, end_time: str) -> tupl
         kills = resp.json().get("data", {}).get("killmails", [])
     except Exception as e:
         log.warning(f"warbeacon auto fetch failed for system {solar_system_id}: {e}")
-        return 0, 0
+        return None, None
 
     if not kills:
         return 0, 0
 
     frat_id = int(FRATERNITY_ALLIANCE_ID)
 
-    # Build team rosters:
+    # Build team rosters iteratively until stable — handles out-of-order kills where
+    # an FRT ally appears as victim before being seen attacking alongside FRT.
     # - FRT in attackers → victim is enemy, co-attackers are FRT allies
     # - Known FRT ally is victim → attackers are enemies
     frat_side = {frat_id}
     enemy_side = set()
 
-    for kill in kills:
-        victim_alliance = kill.get("victim", {}).get("alliance_id")
-        attacker_alliances = {
-            a["alliance_id"] for a in kill.get("attackers", []) if a.get("alliance_id")
-        }
-        if frat_id in attacker_alliances:
-            if victim_alliance:
-                enemy_side.add(victim_alliance)
-            frat_side.update(attacker_alliances)
-        elif victim_alliance in frat_side:
-            enemy_side.update(attacker_alliances)
-
-    enemy_side -= frat_side
+    prev_state = (-1, -1)
+    while (len(frat_side), len(enemy_side)) != prev_state:
+        prev_state = (len(frat_side), len(enemy_side))
+        for kill in kills:
+            victim_alliance = kill.get("victim", {}).get("alliance_id")
+            attacker_alliances = {
+                a["alliance_id"] for a in kill.get("attackers", []) if a.get("alliance_id")
+            }
+            if frat_id in attacker_alliances:
+                if victim_alliance:
+                    enemy_side.add(victim_alliance)
+                frat_side.update(attacker_alliances)
+            elif victim_alliance in frat_side:
+                enemy_side.update(attacker_alliances)
+        enemy_side -= frat_side
 
     frat_isk = 0.0
     enemy_isk = 0.0
@@ -344,12 +348,12 @@ def parse_warbeacon_brs(data: dict) -> list:
             "uuid": br_uuid,
             "source": "warbeacon",
             "_system_id": solar_system_id,   # popped by resolve_system_names
-            "_solar_system_id": solar_system_id,  # kept for zkillboard lookup
+            "_solar_system_id": solar_system_id,  # kept for warbeacon auto API lookup
             "_start_time": start_time,
             "_end_time": end_time,
             "system": str(solar_system_id),
             "_dedup_key": (solar_system_id, start_hour),
-            "isk_destroyed": item.get("totalValue", 0),  # pre-filter; replaced with enemy ISK after zkill
+            "isk_destroyed": item.get("totalValue", 0),  # pre-filter; overwritten with per-side ISK from auto API
             "isk_lost": 0,
             "efficiency": 0,
             "pilots": participant_count,
@@ -453,8 +457,12 @@ def poll_and_post(client: BlueskyClient, seen: set) -> tuple:
             br["_solar_system_id"], br["_start_time"], br["_end_time"]
         )
 
+        if frat_isk is None:
+            log.warning(f"Skipping {br['uuid']}: auto API unreachable for {br['system']} — will retry next poll")
+            continue
+
         if frat_isk == 0 and enemy_isk == 0:
-            log.warning(f"Skipping {br['uuid']}: no kill data returned for {br['system']}")
+            log.warning(f"Skipping {br['uuid']}: no kill data matched known alliances in {br['system']}")
             seen.add(br_key)
             newly_added.add(br_key)
             continue
@@ -480,7 +488,7 @@ def poll_and_post(client: BlueskyClient, seen: set) -> tuple:
 
         try:
             text = generate_post(br)
-            client.post(text=text, url=br["url"])
+            client.post(text=text, url=br["url"], embed_title=f"Battle Report — {br['system']}")
             posted_count += 1
         except Exception as e:
             log.error(f"Failed to post BR {br['uuid']}: {e}")
