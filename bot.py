@@ -167,7 +167,7 @@ class BlueskyClient:
         self.session = resp.json()
         log.info(f"Logged in to Bluesky as {self.handle}")
 
-    def post(self, text: str, url: str = None, embed_title: str = "Battle Report"):
+    def post(self, text: str, url: str = None, embed_title: str = "Battle Report", embed_description: str = "EVE Online Battle Report"):
         if not self.session:
             self.login()
 
@@ -181,7 +181,7 @@ class BlueskyClient:
                 "external": {
                     "uri": url,
                     "title": embed_title,
-                    "description": "EVE Online Battle Report",
+                    "description": embed_description,
                 },
             }
 
@@ -531,10 +531,17 @@ def poll_and_post(client: BlueskyClient, seen: set) -> tuple:
         if br_key in seen:
             continue
         title = post["title"]
-        if len(title) > 300:
-            title = title[:297] + "..."
+        prefix = f"u/{REDDIT_USER} posted in r/{REDDIT_SUBREDDIT}:\n"
+        text = prefix + title
+        if len(text) > 300:
+            text = text[:297] + "..."
         try:
-            client.post(text=title, url=post["url"], embed_title=post["title"])
+            client.post(
+                text=text,
+                url=post["url"],
+                embed_title=title,
+                embed_description=f"r/{REDDIT_SUBREDDIT} • u/{REDDIT_USER}",
+            )
             log.info(f"Cross-posted Reddit post {post['uuid']}: {title[:60]}")
         except Exception as e:
             log.error(f"Failed to cross-post Reddit post {post['uuid']}: {e}")
