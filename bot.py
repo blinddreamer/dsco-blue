@@ -41,6 +41,10 @@ EVETOOLS_API = "https://br.evetools.org/api/v1/recent-br"
 EVETOOLS_COMPOSITION_API = "https://br.evetools.org/newapi/br/composition/{}"
 EVETOOLS_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; dsco-bluesky-bot/1.0)"}
 
+REDDIT_USER = os.getenv("REDDIT_WATCH_USER", "eve_revisionism")
+REDDIT_SUBREDDIT = os.getenv("REDDIT_WATCH_SUBREDDIT", "Eve")
+REDDIT_HEADERS = {"User-Agent": "dsco-bluesky-bot/1.0 (cross-poster)"}
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -398,6 +402,37 @@ def generate_post(br: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Reddit cross-poster
+# ---------------------------------------------------------------------------
+def fetch_reddit_posts() -> list:
+    """Return recent posts by REDDIT_USER in REDDIT_SUBREDDIT as normalized dicts."""
+    url = f"https://www.reddit.com/user/{REDDIT_USER}/submitted.json?limit=25&sort=new"
+    try:
+        resp = requests.get(url, headers=REDDIT_HEADERS, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        log.warning(f"Reddit fetch failed: {e}")
+        return []
+
+    posts = []
+    for child in data.get("data", {}).get("children", []):
+        p = child.get("data", {})
+        if p.get("subreddit", "").lower() != REDDIT_SUBREDDIT.lower():
+            continue
+        post_id = p.get("id", "")
+        if not post_id:
+            continue
+        posts.append({
+            "uuid": post_id,
+            "source": "reddit",
+            "title": p.get("title", ""),
+            "url": f"https://www.reddit.com{p.get('permalink', '')}",
+        })
+    return posts
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 def poll_and_post(client: BlueskyClient, seen: set) -> tuple:
@@ -488,6 +523,25 @@ def poll_and_post(client: BlueskyClient, seen: set) -> tuple:
     if posted_count == 0:
         log.debug("No new wins to post")
 
+    # --- Poll Reddit for u/REDDIT_USER posts in r/REDDIT_SUBREDDIT ---
+    reddit_posts = fetch_reddit_posts()
+    log.info(f"Reddit: found {len(reddit_posts)} recent posts by u/{REDDIT_USER} in r/{REDDIT_SUBREDDIT}")
+    for post in reddit_posts:
+        br_key = f"reddit:{post['uuid']}"
+        if br_key in seen:
+            continue
+        title = post["title"]
+        if len(title) > 300:
+            title = title[:297] + "..."
+        try:
+            client.post(text=title, url=post["url"], embed_title=post["title"])
+            log.info(f"Cross-posted Reddit post {post['uuid']}: {title[:60]}")
+        except Exception as e:
+            log.error(f"Failed to cross-post Reddit post {post['uuid']}: {e}")
+        seen.add(br_key)
+        newly_added.add(br_key)
+        time.sleep(3)
+
     return seen, newly_added
 
 
@@ -504,6 +558,7 @@ def main():
     log.info(f"  Min pilots: {MIN_PILOTS}")
     log.info(f"  Min FRT pilots: {MIN_FRT_PILOTS}")
     log.info(f"  Min ISK destroyed: {format_isk(MIN_ISK_DESTROYED)}")
+    log.info(f"  Reddit cross-poster: u/{REDDIT_USER} in r/{REDDIT_SUBREDDIT}")
 
     try:
         init_db()

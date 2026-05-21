@@ -1,8 +1,10 @@
 # D-SCO Bluesky Battle Report Bot
 
-Automatically posts Fraternity. battle report wins to Bluesky with smirky propaganda comments.
+Automatically posts Fraternity. battle report wins to Bluesky with smirky propaganda comments, and cross-posts selected Reddit content from r/Eve.
 
 ## How it works
+
+### Battle reports
 
 1. Polls `br.evetools.org/api/v1/recent-br` every 10 minutes (configurable)
 2. Filters for battles where Fraternity. (alliance `99003581`) or D-SCO (corp `98519746`) appears on a team
@@ -11,6 +13,10 @@ Automatically posts Fraternity. battle report wins to Bluesky with smirky propag
 5. Skips the battle if FRT's side lost more ISK than the enemy (loss filter) — equal ISK (draws) are posted
 6. Picks a random smirky propaganda line and posts to Bluesky with a link to the evetools BR
 7. Deduplicates via MariaDB — same system + same UTC day keeps only the largest BR by ISK, so multi-submit spam is collapsed before posting
+
+### Reddit cross-poster
+
+On each poll cycle the bot also fetches recent submissions by `u/eve_revisionism` in `r/Eve` and cross-posts any new ones to Bluesky as link embeds (post title as text, Reddit permalink as the embedded link). Already-posted Reddit entries are tracked in the same `seen_brs` database table using `reddit:<id>` keys.
 
 ## Setup
 
@@ -58,16 +64,18 @@ python bot.py
 
 ### Optional
 
-| Variable            | Default     | Description                                                                          |
-| ------------------- | ----------- | ------------------------------------------------------------------------------------ |
-| `DB_HOST`           | `localhost` | MariaDB host                                                                         |
-| `DB_PORT`           | `3306`      | MariaDB port                                                                         |
-| `DB_NAME`           | `dsco_bot`  | MariaDB database name                                                                |
-| `POLL_INTERVAL`     | `600`       | Seconds between polls                                                                |
-| `MIN_PILOTS`        | `20`        | Minimum total pilots in a battle to consider                                         |
-| `MIN_FRT_PILOTS`    | `10`        | Minimum FRT/D-SCO pilots that must be present in the BR                              |
-| `MIN_ISK_DESTROYED` | `500000000` | Minimum combined battle ISK (both sides) as a pre-filter — default 500M             |
-| `LOG_LEVEL`         | `INFO`      | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`)                              |
+| Variable                  | Default           | Description                                                                          |
+| ------------------------- | ----------------- | ------------------------------------------------------------------------------------ |
+| `DB_HOST`                 | `localhost`       | MariaDB host                                                                         |
+| `DB_PORT`                 | `3306`            | MariaDB port                                                                         |
+| `DB_NAME`                 | `dsco_bot`        | MariaDB database name                                                                |
+| `POLL_INTERVAL`           | `600`             | Seconds between polls                                                                |
+| `MIN_PILOTS`              | `20`              | Minimum total pilots in a battle to consider                                         |
+| `MIN_FRT_PILOTS`          | `10`              | Minimum FRT/D-SCO pilots that must be present in the BR                              |
+| `MIN_ISK_DESTROYED`       | `500000000`       | Minimum combined battle ISK (both sides) as a pre-filter — default 500M             |
+| `LOG_LEVEL`               | `INFO`            | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`)                              |
+| `REDDIT_WATCH_USER`       | `eve_revisionism` | Reddit username whose posts are cross-posted to Bluesky                              |
+| `REDDIT_WATCH_SUBREDDIT`  | `Eve`             | Subreddit to filter the user's posts against                                         |
 
 `MIN_ISK_DESTROYED` is checked against the combined ISK from the evetools summary endpoint before the per-team composition fetch — it avoids hitting the composition API for tiny skirmishes. The actual win/loss check uses per-side ISK from the composition data.
 
@@ -100,8 +108,9 @@ Posts are capped at 300 graphemes to comply with the Bluesky limit.
 
 ## External APIs used
 
-| API                                          | Purpose                                              |
-| -------------------------------------------- | ---------------------------------------------------- |
-| `br.evetools.org/api/v1/recent-br`           | Poll for recent BRs with FRT/D-SCO present           |
-| `br.evetools.org/newapi/br/composition/{id}` | Fetch per-team kill data to compute per-side ISK     |
-| `bsky.social/xrpc/...`                       | Post to Bluesky (auto re-authenticates on token expiry) |
+| API                                          | Purpose                                                  |
+| -------------------------------------------- | -------------------------------------------------------- |
+| `br.evetools.org/api/v1/recent-br`           | Poll for recent BRs with FRT/D-SCO present               |
+| `br.evetools.org/newapi/br/composition/{id}` | Fetch per-team kill data to compute per-side ISK         |
+| `bsky.social/xrpc/...`                       | Post to Bluesky (auto re-authenticates on token expiry)  |
+| `reddit.com/user/{user}/submitted.json`      | Fetch recent submissions by the watched Reddit user (no auth required — public API) |
