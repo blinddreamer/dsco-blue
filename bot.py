@@ -11,6 +11,9 @@ import logging
 from contextlib import closing
 from datetime import datetime, timezone
 
+import re
+import xml.etree.ElementTree as ET
+
 import pymysql
 import requests
 from collections import defaultdict
@@ -37,7 +40,7 @@ DB_USER     = os.getenv("DB_USER", "")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_NAME     = os.getenv("DB_NAME", "dsco_bot")
 
-EVETOOLS_API = "https://br.evetools.org/api/v1/recent-br"
+EVETOOLS_API = "https://br.evetools.org/newapi/old/recent-br"
 EVETOOLS_COMPOSITION_API = "https://br.evetools.org/newapi/br/composition/{}"
 EVETOOLS_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; dsco-bluesky-bot/1.0)"}
 
@@ -405,29 +408,35 @@ def generate_post(br: dict) -> str:
 # Reddit cross-poster
 # ---------------------------------------------------------------------------
 def fetch_reddit_posts() -> list:
-    """Return recent posts by REDDIT_USER in REDDIT_SUBREDDIT as normalized dicts."""
-    url = f"https://www.reddit.com/user/{REDDIT_USER}/submitted.json?limit=25&sort=new"
+    """Return recent posts by REDDIT_USER in REDDIT_SUBREDDIT via RSS feed."""
+    url = f"https://www.reddit.com/user/{REDDIT_USER}/submitted.rss?limit=25"
     try:
         resp = requests.get(url, headers=REDDIT_HEADERS, timeout=30)
         resp.raise_for_status()
-        data = resp.json()
+        root = ET.fromstring(resp.text)
     except Exception as e:
-        log.warning(f"Reddit fetch failed: {e}")
+        log.warning(f"Reddit RSS fetch failed: {e}")
         return []
 
+    # Reddit serves user RSS as Atom
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
     posts = []
-    for child in data.get("data", {}).get("children", []):
-        p = child.get("data", {})
-        if p.get("subreddit", "").lower() != REDDIT_SUBREDDIT.lower():
+    for entry in root.findall("atom:entry", ns):
+        link_el = entry.find("atom:link", ns)
+        if link_el is None:
             continue
-        post_id = p.get("id", "")
-        if not post_id:
+        post_url = link_el.get("href", "")
+        if f"/r/{REDDIT_SUBREDDIT}/" not in post_url:
             continue
+        match = re.search(r"/comments/([a-z0-9]+)/", post_url)
+        if not match:
+            continue
+        title_el = entry.find("atom:title", ns)
         posts.append({
-            "uuid": post_id,
+            "uuid": match.group(1),
             "source": "reddit",
-            "title": p.get("title", ""),
-            "url": f"https://www.reddit.com{p.get('permalink', '')}",
+            "title": title_el.text if title_el is not None else "",
+            "url": post_url,
         })
     return posts
 
