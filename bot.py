@@ -25,7 +25,6 @@ BLUESKY_HANDLE = os.getenv("BLUESKY_HANDLE", "")
 BLUESKY_APP_PASSWORD = os.getenv("BLUESKY_APP_PASSWORD", "")
 
 FRATERNITY_ALLIANCE_ID = "99003581"
-DSCO_CORP_ID = "98519746"
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "600"))  # seconds
 MIN_PILOTS = int(os.getenv("MIN_PILOTS", "20"))  # minimum pilots to post
@@ -276,7 +275,7 @@ def parse_evetools_brs(data) -> list:
         # Find which team FRT is on.
         frat_team_idx = None
         for idx, team in enumerate(teams):
-            if FRATERNITY_ALLIANCE_ID in _team_ids(team) or f"corp:{DSCO_CORP_ID}" in _team_ids(team):
+            if FRATERNITY_ALLIANCE_ID in _team_ids(team):
                 frat_team_idx = idx
                 break
 
@@ -285,7 +284,8 @@ def parse_evetools_brs(data) -> list:
 
         # Normalise teams to lists of strings for later use
         norm_teams = [_team_ids(t) for t in teams]
-        frat_pilots = sum(ally_pilot_map.get(a, 0) for a in norm_teams[frat_team_idx])
+        # Only count Fraternity's own pilots, not allied pilots sharing the same side.
+        frat_pilots = ally_pilot_map.get(FRATERNITY_ALLIANCE_ID, 0)
 
         # Get system name and ID for dedup key
         system_name = "Unknown"

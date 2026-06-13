@@ -7,7 +7,7 @@ Automatically posts Fraternity. battle report wins to Bluesky with smirky propag
 ### Battle reports
 
 1. Polls `br.evetools.org/api/v1/recent-br` every 10 minutes (configurable)
-2. Filters for battles where Fraternity. (alliance `99003581`) or D-SCO (corp `98519746`) appears on a team
+2. Filters for battles where Fraternity. (alliance `99003581`) appears on a team
 3. Skips battles below the minimum total pilot / FRT pilot / ISK thresholds
 4. For each qualifying battle, calls `br.evetools.org/newapi/br/composition/{id}` to fetch per-team ISK lost
 5. Skips the battle if FRT's side lost more ISK than the enemy (loss filter) — equal ISK (draws) are posted
@@ -71,7 +71,7 @@ python bot.py
 | `DB_NAME`                 | `dsco_bot`        | MariaDB database name                                                                |
 | `POLL_INTERVAL`           | `600`             | Seconds between polls                                                                |
 | `MIN_PILOTS`              | `20`              | Minimum total pilots in a battle to consider                                         |
-| `MIN_FRT_PILOTS`          | `10`              | Minimum FRT/D-SCO pilots that must be present in the BR                              |
+| `MIN_FRT_PILOTS`          | `10`              | Minimum FRT pilots that must be present in the BR                                    |
 | `MIN_ISK_DESTROYED`       | `500000000`       | Minimum combined battle ISK (both sides) as a pre-filter — default 500M             |
 | `LOG_LEVEL`               | `INFO`            | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`)                              |
 | `REDDIT_WATCH_USER`       | `eve_revisionism` | Reddit username whose posts are cross-posted to Bluesky                              |
@@ -81,9 +81,9 @@ python bot.py
 
 ## Win criteria (all must pass)
 
-1. Fraternity. or D-SCO is on a team in the BR
+1. Fraternity. is on a team in the BR
 2. Total pilots ≥ `MIN_PILOTS`
-3. FRT/D-SCO pilots in BR ≥ `MIN_FRT_PILOTS`
+3. FRT pilots in BR ≥ `MIN_FRT_PILOTS`
 4. Combined battle ISK ≥ `MIN_ISK_DESTROYED`
 5. Composition data is fetchable (retried next cycle on failure)
 6. Enemy ISK lost > FRT ISK lost (draws count as wins)
@@ -110,7 +110,7 @@ Posts are capped at 300 graphemes to comply with the Bluesky limit.
 
 | API                                          | Purpose                                                  |
 | -------------------------------------------- | -------------------------------------------------------- |
-| `br.evetools.org/api/v1/recent-br`           | Poll for recent BRs with FRT/D-SCO present               |
+| `br.evetools.org/api/v1/recent-br`           | Poll for recent BRs with FRT present                     |
 | `br.evetools.org/newapi/br/composition/{id}` | Fetch per-team kill data to compute per-side ISK         |
 | `bsky.social/xrpc/...`                       | Post to Bluesky (auto re-authenticates on token expiry)  |
 | `reddit.com/user/{user}/submitted.json`      | Fetch recent submissions by the watched Reddit user (no auth required — public API) |
